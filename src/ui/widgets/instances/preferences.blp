@@ -59,6 +59,14 @@ template $AlpacaInstancePreferencesDialog: Adw.Dialog {
         Adw.EntryRow url_el {
           title: _("Instance URL");
           name: "url";
+
+          [suffix]
+          Gtk.Box connection_status_icon {
+            name: "connection_status_icon";
+            visible: false;
+            valign: center;
+            orientation: horizontal;
+          }
         }
 
         Adw.PasswordEntryRow api_el {
