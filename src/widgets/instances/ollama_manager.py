@@ -195,7 +195,7 @@ class OllamaManager(Adw.Dialog):
             result = self.install_latest_rocm()
             GLib.idle_add(self.navigation_view.replace_with_tags, ["installation_ok"] if result else ["error"])
             self.instance.stop()
-            if self.instance.row.get_root():
+            if self.instance.row and self.instance.row.get_root():
                 threading.Thread(target=self.instance.start).start()
         threading.Thread(target=run_install, daemon=True).start()
 
@@ -206,7 +206,7 @@ class OllamaManager(Adw.Dialog):
             result = self.install_latest_ollama()
             GLib.idle_add(self.navigation_view.replace_with_tags, ["installation_ok"] if result else ["error"])
             self.instance.stop()
-            if self.instance.row.get_root():
+            if self.instance.row and self.instance.row.get_root():
                 threading.Thread(target=self.instance.start).start()
         if CAN_SELF_MANAGE_OLLAMA:
             threading.Thread(target=run_install, daemon=True).start()
@@ -222,7 +222,7 @@ class OllamaManager(Adw.Dialog):
     def delete_rocm(self, button):
         self.remove_rocm()
         self.instance.stop()
-        if self.instance.row.get_root():
+        if self.instance.row and self.instance.row.get_root():
             threading.Thread(target=self.instance.start).start()
         self.close()
 

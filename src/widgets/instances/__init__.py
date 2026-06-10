@@ -2,7 +2,7 @@
 
 from gi.repository import Adw, Gtk, GLib, Gio
 
-import os, shutil, json, re, logging, importlib.util
+import os, shutil, json, re, logging, importlib.util, threading
 from ...sql_manager import generate_uuid, generate_numbered_name, prettify_model_name, Instance as SQL
 from .. import dialog
 from .ollama_instances import BaseInstance as BaseOllama
@@ -23,6 +23,7 @@ class InstancePreferencesDialog(Adw.Dialog):
     name_el = Gtk.Template.Child()
     port_el = Gtk.Template.Child()
     url_el = Gtk.Template.Child()
+    connection_status_icon = Gtk.Template.Child()
     api_el = Gtk.Template.Child()
 
     tweak_group = Gtk.Template.Child()
@@ -61,14 +62,25 @@ class InstancePreferencesDialog(Adw.Dialog):
         self.instance = instance
         self.set_title(_('Edit Instance') if self.instance.instance_id else _('Create Instance'))
         self.model_list = []
+        self._model_list_populated = False
+        self._retry_gesture = None
+        self._closed = False
+        self._original_url = self.instance.properties.get('url', '')
+        self._original_api = self.instance.properties.get('api', '')
+        self._last_committed_url = self._original_url
+        self._last_committed_api = self._original_api
 
         # CONNECTION GROUP
         self.connection_group.set_title(self.instance.instance_type_display)
         self.connection_group.set_description(self.instance.description or self.instance.properties.get('url'))
 
         self.set_simple_element_value(self.name_el)
-
         self.set_simple_element_value(self.url_el)
+        
+        url_focus_ctrl = Gtk.EventControllerFocus.new()
+        url_focus_ctrl.connect('leave', lambda _: self._on_connection_field_changed('url'))
+        self.url_el.add_controller(url_focus_ctrl)
+
         if self.instance.instance_type in ('ollama', 'ollama:managed', 'openai:generic', 'llama_cpp'):
             if self.instance.instance_type == 'ollama:managed':
                 try:
@@ -81,11 +93,13 @@ class InstancePreferencesDialog(Adw.Dialog):
                 
                 self.port_el.set_value(port)
                 self.url_el.set_visible(False)
+                self.connection_status_icon.set_visible(False)
             else:
                 self.port_el.set_visible(False)
         else:
             self.url_el.set_visible(False)
             self.port_el.set_visible(False)
+            self.connection_status_icon.set_visible(False)
 
         if 'api' in self.instance.properties:
             # Set the title based on the instance type to keep the Cloudflare hint
@@ -100,6 +114,9 @@ class InstancePreferencesDialog(Adw.Dialog):
             self.api_el.connect('changed', lambda el: el.set_title(normal_api_title if el.get_text() else unchanged_api_title))
 
             self.set_simple_element_value(self.api_el)
+            api_focus_ctrl = Gtk.EventControllerFocus.new()
+            api_focus_ctrl.connect('leave', lambda _: self._on_connection_field_changed('api'))
+            self.api_el.add_controller(api_focus_ctrl)
 
         # TWEAK GROUP
         self.set_simple_element_value(self.think_el)
@@ -143,21 +160,142 @@ class InstancePreferencesDialog(Adw.Dialog):
             self.default_model_el.set_factory(factory)
             self.title_model_el.set_factory(factory)
 
-            string_list_default = Gtk.StringList()
-            string_list_title = Gtk.StringList()
-            string_list_title.append(_('Use Current Model'))
-            self.model_list = self.instance.get_local_models()
-            for i, model in enumerate(self.model_list):
-                string_list_default.append(prettify_model_name(model.get('name')))
-                string_list_title.append(prettify_model_name(model.get('name')))
+            self._reset_default_model()
+            self._reset_title_model()
 
-            self.default_model_el.set_model(string_list_default)
-            self.set_simple_element_value(self.default_model_el)
-            self.title_model_el.set_model(string_list_title)
-            self.set_simple_element_value(self.title_model_el)
+            self.default_model_el.set_visible(True)
+            self.title_model_el.set_visible(True)
+            self.model_group.set_visible(True)
+
+            GLib.idle_add(self._fetch_models_async)
         else:
             self.default_model_el.set_visible(False)
             self.title_model_el.set_visible(False)
+
+    def _on_connection_field_changed(self, field_name):
+        if self._closed:
+            return
+
+        current_value = self.get_value(getattr(self, f'{field_name}_el'))
+        last_committed_value = getattr(self, f'_last_committed_{field_name}')
+
+        if current_value == last_committed_value:
+            return
+
+        setattr(self, f'_last_committed_{field_name}', current_value)
+
+        if self._model_list_populated:
+            self._retry_connection()
+
+    def _set_connection_icon(self, state):
+        self.connection_status_icon.set_visible(True)
+
+        while self.connection_status_icon.get_first_child():
+            self.connection_status_icon.remove(self.connection_status_icon.get_first_child())
+
+        if state == 'loading':
+            spinner = Gtk.Spinner()
+            spinner.set_visible(True)
+            spinner.start()
+            self.connection_status_icon.append(spinner)
+            self.connection_status_icon.set_tooltip_text(_('Checking connection…'))
+        elif state == 'success':
+            icon = Gtk.Image()
+            icon.set_from_icon_name('check-plain-symbolic')
+            icon.set_visible(True)
+            self.connection_status_icon.append(icon)
+            self.connection_status_icon.set_tooltip_text(_('Connection OK'))
+        elif state == 'failed':
+            icon = Gtk.Image()
+            icon.set_from_icon_name('cross-large-symbolic')
+            icon.set_visible(True)
+            self.connection_status_icon.append(icon)
+            self.connection_status_icon.set_tooltip_text(_('Connection failed — click to retry'))
+
+    def _fetch_models_async(self):
+        if not self.instance.instance_id or self._model_list_populated:
+            return False
+
+        GLib.idle_add(self._set_connection_icon, 'loading')
+
+        def _thread_fetch():
+            try:
+                self.instance.start()
+                try:
+                    self.instance.client.list()
+                    models = self.instance.get_local_models()
+                except Exception as e:
+                    models = None
+                    logger.error(f"Failed to connect to Ollama: {e}")
+
+                GLib.idle_add(self._on_models_fetched, models)
+            except Exception as e:
+                logger.error(e)
+                GLib.idle_add(self._on_models_fetched, None)
+
+        threading.Thread(target=_thread_fetch, daemon=True).start()
+        return False
+
+    def _on_models_fetched(self, models):
+        if self._closed:
+            return
+
+        if hasattr(self, '_saved_properties'):
+            for key, val in self._saved_properties.items():
+                self.instance.properties[key] = val
+            # Restore client: stop the one from retry attempt so next start() creates fresh connection with old properties
+            self.instance.stop()
+            del self._saved_properties
+
+        if models is not None:
+            self._set_connection_icon('success')
+            self.model_list = models
+            self._model_list_populated = True
+
+            string_list_default = self.default_model_el.get_model()
+            string_list_title = self.title_model_el.get_model()
+
+            for model in self.model_list:
+                pretty_name = prettify_model_name(model.get('name'))
+                string_list_default.append(pretty_name)
+                string_list_title.append(pretty_name)
+
+            self.set_simple_element_value(self.default_model_el)
+            self.set_simple_element_value(self.title_model_el)
+        else:
+            self._set_connection_icon('failed')
+            self._model_list_populated = True
+            if self._retry_gesture is None:
+                self._retry_gesture = Gtk.GestureClick.new()
+                self._retry_gesture.connect('released', lambda n_press, x, y, _: self._retry_connection())
+                self.connection_status_icon.add_controller(self._retry_gesture)
+
+    def _retry_connection(self):
+        if self._closed:
+            return
+
+        self._model_list_populated = False
+
+        self._saved_properties = {}
+        for el in [self.url_el, self.api_el]:
+            key = el.get_name()
+            if key in self.instance.properties:
+                self._saved_properties[key] = self.instance.properties[key]
+                self.instance.properties[key] = self.get_value(el)
+
+        self.instance.stop()
+        self._reset_default_model()
+        self._reset_title_model()
+
+        self._fetch_models_async()
+
+    def _reset_default_model(self):
+        self.default_model_el.set_model(Gtk.StringList())
+
+    def _reset_title_model(self):
+        title_list = Gtk.StringList()
+        title_list.append(_('Use Current Model'))
+        self.title_model_el.set_model(title_list)
 
     def set_simple_element_value(self, el):
         if el.get_name().startswith('override:'):
@@ -204,12 +342,17 @@ class InstancePreferencesDialog(Adw.Dialog):
             if len(self.model_list) == 0:
                 return None
             index = el.get_selected()
+            if index < 0 or index >= len(self.model_list):
+                return self.instance.properties.get('default_model')
             return self.model_list[index].get('name')
         elif el.get_name() == 'title_model':
             index = el.get_selected()
             if index == 0 or len(self.model_list) == 0:
                 return None
-            return self.model_list[index - 1].get('name')
+            adj_index = index - 1
+            if adj_index < 0 or adj_index >= len(self.model_list):
+                return self.instance.properties.get('title_model')
+            return self.model_list[adj_index].get('name')
         elif el.get_name() == 'model_directory':
             return el.get_subtitle()
         elif el.get_name() == 'override:OLLAMA_VULKAN':
@@ -269,6 +412,7 @@ class InstancePreferencesDialog(Adw.Dialog):
         else:
             self.get_root().instance_manager_stack.set_visible_child_name('no-instances')
 
+        self._closed = True
         self.instance.start()
 
         self.close()
@@ -299,6 +443,15 @@ class InstancePreferencesDialog(Adw.Dialog):
 
     @Gtk.Template.Callback()
     def close_requested(self, button=None):
+        self._closed = True
+        self.instance.stop()
+
+        if self.instance.properties.get('url', '') != self._original_url:
+            self.instance.properties['url'] = self._original_url
+
+        if self.instance.properties.get('api', '') != self._original_api:
+            self.instance.properties['api'] = self._original_api
+
         self.close()
 
     @Gtk.Template.Callback()
